@@ -1,4 +1,4 @@
-name: Build and release OpenCPN Android v2
+name: Build and release OpenCPN Android arm64
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: opencpn-android-${{ inputs.opencpn_tag }}
+  group: opencpn-android-arm64-${{ inputs.opencpn_tag }}
   cancel-in-progress: false
 
 jobs:
@@ -71,7 +71,7 @@ jobs:
           git clone --depth 1 --branch "$OPENCPN_TAG" \
             https://github.com/OpenCPN/OpenCPN.git "$OCPN_SRC"
 
-          # Full history is intentional. We select the newest Android packaging
+          # Full history is intentional. Select the newest Android packaging
           # commit whose versionName matches the requested OpenCPN release.
           git clone https://github.com/bdbcat/OpenCPN-Android.git "$ANDROID_SRC"
           ANDROID_COMMIT=""
@@ -89,7 +89,7 @@ jobs:
           fi
           git -C "$ANDROID_SRC" checkout --detach "$ANDROID_COMMIT"
 
-          # This repository contains the Qt Android runtime used by the APK packager.
+          # Prebuilt Qt Android runtime used by the APK packager.
           git clone --depth 1 https://github.com/bdbcat/OCPNAndroidCommon.git "$COMMON_SRC"
 
           {
@@ -101,7 +101,7 @@ jobs:
             echo "android_commit=$ANDROID_COMMIT"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build OpenCPN native libraries for Android
+      - name: Build OpenCPN native library for Android arm64
         shell: bash
         env:
           OCPN_SRC: ${{ steps.versions.outputs.ocpn_src }}
@@ -109,16 +109,14 @@ jobs:
           set -euxo pipefail
 
           TOOL_BASE="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
-          test -x "$TOOL_BASE/bin/armv7a-linux-androideabi21-clang++"
           test -x "$TOOL_BASE/bin/aarch64-linux-android21-clang++"
           test -x "$TOOL_BASE/bin/llvm-ar"
           test -x "$TOOL_BASE/bin/llvm-ranlib"
           test -x "$TOOL_BASE/bin/llvm-strip"
 
           # OpenCPN 5.14.0 hard-codes aarch64-linux-android-ar for arm64.
-          # That binary does not exist in NDK 26. Patch OpenCPN's toolchain
-          # source before configure so its own unconditional set(CMAKE_AR ...)
-          # cannot override a command-line cache value.
+          # That binary does not exist in NDK 26. Patch the toolchain source
+          # itself before configure so CMake cannot restore the obsolete tool.
           OCPN_TOOLCHAIN="$OCPN_SRC/buildandroid/build_android.cmake"
           python3 - "$OCPN_TOOLCHAIN" <<'PY'
           import sys
@@ -136,37 +134,40 @@ jobs:
               )
 
           text = text.replace(old, new, 1)
-
-          # Set ranlib explicitly for both ABI branches. LLVM's unprefixed
-          # binutils are the supported NDK tools and are ABI-independent.
           lines = text.splitlines()
-          ar_indexes = [i for i, line in enumerate(lines)
-                        if line.strip() == "set(CMAKE_AR ${tool_base}/bin/llvm-ar)"]
-          if len(ar_indexes) != 2:
-              raise SystemExit(
-                  f"Expected two llvm-ar settings after patching {path}, found {len(ar_indexes)}"
-              )
 
-          output = []
-          for line in lines:
-              output.append(line)
-              if line.strip() == "set(CMAKE_AR ${tool_base}/bin/llvm-ar)":
-                  indent = line[:len(line) - len(line.lstrip())]
-                  output.append(indent + "set(CMAKE_RANLIB ${tool_base}/bin/llvm-ranlib)")
-          path.write_text("\n".join(output) + "\n")
+          # Only the arm64 branch matters in this workflow. Add an explicit
+          # LLVM ranlib immediately after the arm64 llvm-ar setting.
+          arm64_marker = "set(CMAKE_C_COMPILER ${tool_base}/bin/aarch64-linux-android21-clang)"
+          try:
+              arm64_start = next(i for i, line in enumerate(lines) if line.strip() == arm64_marker)
+          except StopIteration:
+              raise SystemExit(f"Could not locate arm64 toolchain branch in {path}")
+
+          ar_index = next(
+              (i for i in range(arm64_start, len(lines))
+               if lines[i].strip() == "set(CMAKE_AR ${tool_base}/bin/llvm-ar)"),
+              None,
+          )
+          if ar_index is None:
+              raise SystemExit(f"Could not locate patched arm64 llvm-ar setting in {path}")
+
+          indent = lines[ar_index][:len(lines[ar_index]) - len(lines[ar_index].lstrip())]
+          if ar_index + 1 >= len(lines) or "CMAKE_RANLIB" not in lines[ar_index + 1]:
+              lines.insert(ar_index + 1, indent + "set(CMAKE_RANLIB ${tool_base}/bin/llvm-ranlib)")
+
+          path.write_text("\n".join(lines) + "\n")
           PY
 
           grep -nE 'CMAKE_(AR|RANLIB)' "$OCPN_TOOLCHAIN"
           if grep -Fq 'aarch64-linux-android-ar' "$OCPN_TOOLCHAIN"; then
-            echo "Obsolete NDK archiver still present in OpenCPN toolchain." >&2
+            echo "Obsolete NDK arm64 archiver still present in OpenCPN toolchain." >&2
             exit 1
           fi
 
-          # OpenCPN otherwise downloads RapidJSON v1.1.0 and applies four
-          # legacy in-tree patches with GNU patch. The failed run proved that
-          # this mutation path can leave document.h truncated. Avoid that path
-          # completely by supplying the exact pristine v1.1.0 source tree via
-          # RAPIDJSON, which makes OpenCPN use its existing find_path branch.
+          # Avoid OpenCPN's legacy RapidJSON patch path entirely. Supply the
+          # exact pristine RapidJSON v1.1.0 tree via its supported RAPIDJSON
+          # find_path input instead of letting FetchContent download and patch it.
           RAPIDJSON_COMMIT="f54b0e47a08782a6131cc3d60f94d038fa6e0a51"
           RAPIDJSON_SRC="$RUNNER_TEMP/rapidjson-v1.1.0"
           git clone --depth 1 --branch v1.1.0 \
@@ -179,46 +180,37 @@ jobs:
           grep -Fq '#endif // RAPIDJSON_DOCUMENT_H_' "$RAPIDJSON_DOC"
           grep -Fq 'bool EraseMember(const GenericValue<EncodingType, SourceAllocator>& name) const {' "$RAPIDJSON_DOC"
 
-          build_one() {
-            local build_dir="$1"
-            local target_tuple="$2"
+          BUILD_DIR="$OCPN_SRC/build_android_64_cci_22b"
+          cmake -S "$OCPN_SRC" -B "$BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE=Release \
+            "-DOCPN_TARGET_TUPLE:STRING=Android-arm64;16;arm64" \
+            -DOCPN_BUILD_SAMPLE=ON \
+            -Dtool_base="$TOOL_BASE" \
+            -DRAPIDJSON:PATH="$RAPIDJSON_SRC/include/rapidjson"
 
-            cmake -S "$OCPN_SRC" -B "$OCPN_SRC/$build_dir" \
-              -DCMAKE_BUILD_TYPE=Release \
-              "-DOCPN_TARGET_TUPLE:STRING=$target_tuple" \
-              -DOCPN_BUILD_SAMPLE=ON \
-              -Dtool_base="$TOOL_BASE" \
-              -DRAPIDJSON:PATH="$RAPIDJSON_SRC/include/rapidjson"
+          # Guard both workarounds before compiling.
+          grep -Fq "${RAPIDJSON_SRC}/include" "$BUILD_DIR/CMakeCache.txt"
+          test ! -d "$BUILD_DIR/_deps/rapidjson_src-src"
 
-            # Guard both workarounds. Fail before compiling if either CMake
-            # silently falls back to the broken path or selects the old tool.
-            grep -Fq "${RAPIDJSON_SRC}/include" "$OCPN_SRC/$build_dir/CMakeCache.txt"
-            test ! -d "$OCPN_SRC/$build_dir/_deps/rapidjson_src-src"
+          if grep -RqsF 'aarch64-linux-android-ar' \
+            "$BUILD_DIR/CMakeFiles" \
+            "$BUILD_DIR/_deps/lunasvg-build/CMakeFiles"; then
+            echo "Generated build rules still reference obsolete aarch64-linux-android-ar." >&2
+            grep -RnsF 'aarch64-linux-android-ar' \
+              "$BUILD_DIR/CMakeFiles" \
+              "$BUILD_DIR/_deps/lunasvg-build/CMakeFiles" || true
+            exit 1
+          fi
 
-            AR_FROM_RULES="$(grep -RhoE '/[^ ]*/(aarch64-linux-android-ar|llvm-ar)' \
-              "$OCPN_SRC/$build_dir"/CMakeFiles \
-              "$OCPN_SRC/$build_dir"/_deps/lunasvg-build/CMakeFiles 2>/dev/null \
-              | sort -u || true)"
-            if printf '%s\n' "$AR_FROM_RULES" | grep -q 'aarch64-linux-android-ar'; then
-              echo "Generated build rules still reference obsolete aarch64-linux-android-ar:" >&2
-              printf '%s\n' "$AR_FROM_RULES" >&2
-              exit 1
-            fi
+          cmake --build "$BUILD_DIR" --target lunasvg --parallel 2
+          cmake --build "$BUILD_DIR" --parallel 2
+          test -s "$BUILD_DIR/libgorp.so"
 
-            cmake --build "$OCPN_SRC/$build_dir" --target lunasvg --parallel 2
-            cmake --build "$OCPN_SRC/$build_dir" --parallel 2
-            test -s "$OCPN_SRC/$build_dir/libgorp.so"
-          }
-
-          build_one build_android_32_cci_22b "Android-armhf;16;armhf"
-          build_one build_android_64_cci_22b "Android-arm64;16;arm64"
-
-          file "$OCPN_SRC/build_android_32_cci_22b/libgorp.so" | tee /tmp/gorp32.txt
-          file "$OCPN_SRC/build_android_64_cci_22b/libgorp.so" | tee /tmp/gorp64.txt
-          grep -q 'ELF 32-bit' /tmp/gorp32.txt
+          file "$BUILD_DIR/libgorp.so" | tee /tmp/gorp64.txt
           grep -q 'ELF 64-bit' /tmp/gorp64.txt
+          grep -Eq 'ARM aarch64|ARM64|aarch64' /tmp/gorp64.txt
 
-      - name: Prepare Android packaging project
+      - name: Prepare arm64-only Android packaging project
         shell: bash
         env:
           OCPN_SRC: ${{ steps.versions.outputs.ocpn_src }}
@@ -227,8 +219,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Upstream's Gradle file contains the maintainer's absolute local paths.
-          # Replace only those roots, leaving the upstream task layout intact.
           OCPN_SRC="$OCPN_SRC" ANDROID_SRC="$ANDROID_SRC" COMMON_SRC="$COMMON_SRC" python3 <<'PY'
           import os
           import re
@@ -237,11 +227,11 @@ jobs:
           path = Path(os.environ["ANDROID_SRC"]) / "app" / "build.gradle"
           text = path.read_text()
 
+          # Replace maintainer-local roots.
           replacements = {
               "Qt_Base": str(Path(os.environ["COMMON_SRC"]) / "qt5"),
               "OCPN_Base": os.environ["OCPN_SRC"],
           }
-
           for name, value in replacements.items():
               pattern = rf'def\s+{re.escape(name)}\s*=\s*"[^"]*"'
               replacement = f'def {name} = "{value}"'
@@ -249,12 +239,79 @@ jobs:
               if count != 1:
                   raise SystemExit(f"Could not patch {name} in {path}")
 
+          # Make shared resources use the arm64 build/runtime. These variables
+          # are also referenced by locale and Qt-JAR copy tasks.
+          text, count = re.subn(
+              r'def\s+Qt_Build\s*=\s*"[^"]*"',
+              'def Qt_Build = "build_arm64_O3"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not redirect Qt_Build to arm64")
+
+          text, count = re.subn(
+              r'def\s+OCPN_Build\s*=\s*"[^"]*"',
+              'def OCPN_Build = "build_android_64_cci_22b"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not redirect OCPN_Build to arm64")
+
+          # Restrict both default and debug Android configurations to arm64-v8a.
+          text, count = re.subn(
+              r"ndk\.abiFilters\s+['\"]armeabi-v7a['\"]\s*,\s*['\"]arm64-v8a['\"]",
+              "ndk.abiFilters 'arm64-v8a'",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not patch defaultConfig ABI filters")
+
+          text, count = re.subn(
+              r'^\s*abiFilters\s+["\']armeabi-v7a["\']\s*$',
+              '',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Could not remove debug armeabi-v7a ABI filter")
+
+          # Disable every active preBuild dependency that produces or consumes
+          # 32-bit native code. Leave data-only and all 64-bit tasks enabled.
+          disable_tasks = {
+              "copyWMM_PIFiles",
+              "copyDNLDR_PIFiles",
+              "copyGRIB_PIFiles",
+              "copyDASHBOARD_PIFiles",
+              "copyQTLibs_armeabi_v7a",
+              "copyOCPN_CORE",
+              "copySERVERFiles32",
+          }
+          for task in sorted(disable_tasks):
+              pattern = rf'^(\s*)preBuild\.dependsOn\({re.escape(task)}\)\s*$'
+              text, count = re.subn(
+                  pattern,
+                  rf'\1// arm64-only: preBuild.dependsOn({task})',
+                  text,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(f"Could not disable active 32-bit task {task}")
+
           path.write_text(text)
           PY
 
+          # Remove any checked-in/stale 32-bit payload before Gradle sees it.
+          rm -rf "$ANDROID_SRC/app/src/main/jniLibs/armeabi-v7a"
+          rm -rf "$ANDROID_SRC/app/src/main/assets/files/Qtplugins/armeabi-v7a"
+          find "$ANDROID_SRC/app/src/main/assets/files/plugins" -type f -name '*.so32' -delete 2>/dev/null || true
+
           # google-services.json is private in the maintainer's build environment.
-          # A non-production placeholder lets the open-source debug APK build while
-          # keeping Firebase/Crashlytics dependencies structurally intact.
+          # A non-production placeholder lets the open-source debug APK build.
           cat > "$ANDROID_SRC/app/google-services.json" <<'JSON'
           {
             "project_info": {
@@ -287,14 +344,17 @@ jobs:
           }
           JSON
 
-          # Fail early if the prebuilt Qt payload expected by upstream Gradle is missing.
-          test -s "$COMMON_SRC/qt5/build_arm32_19_O3/qtbase/jar/QtAndroid.jar"
-          test -s "$COMMON_SRC/qt5/build_arm32_19_O3/qtbase/lib/libQt5Core.so"
+          GRADLE_FILE="$ANDROID_SRC/app/build.gradle"
+          grep -Fq "ndk.abiFilters 'arm64-v8a'" "$GRADLE_FILE"
+          grep -Fq "def Qt_Build = \"build_arm64_O3\"" "$GRADLE_FILE"
+          grep -Fq "def OCPN_Build = \"build_android_64_cci_22b\"" "$GRADLE_FILE"
+          ! grep -Eq '^\s*preBuild\.dependsOn\((copyWMM_PIFiles|copyDNLDR_PIFiles|copyGRIB_PIFiles|copyDASHBOARD_PIFiles|copyQTLibs_armeabi_v7a|copyOCPN_CORE|copySERVERFiles32)\)\s*$' "$GRADLE_FILE"
+
+          test -s "$COMMON_SRC/qt5/build_arm64_O3/qtbase/jar/QtAndroid.jar"
           test -s "$COMMON_SRC/qt5/build_arm64_O3/qtbase/lib/libQt5Core.so"
-          test -s "$OCPN_SRC/build_android_32_cci_22b/libgorp.so"
           test -s "$OCPN_SRC/build_android_64_cci_22b/libgorp.so"
 
-      - name: Build installable APK
+      - name: Build installable arm64 APK
         id: apk
         shell: bash
         env:
@@ -318,12 +378,24 @@ jobs:
           "$AAPT" dump badging "$APK" | grep -q "package: name='org.opencpn.opencpn'"
           "$AAPT" dump badging "$APK" | grep -q "versionName='$OPENCPN_VERSION'"
 
-          unzip -l "$APK" | grep -q 'lib/armeabi-v7a/libgorp.so'
+          # Positive arm64 checks.
           unzip -l "$APK" | grep -q 'lib/arm64-v8a/libgorp.so'
-          unzip -l "$APK" | grep -q 'lib/armeabi-v7a/libQt5Core.so'
           unzip -l "$APK" | grep -q 'lib/arm64-v8a/libQt5Core.so'
 
-          OUT="$RUNNER_TEMP/OpenCPN-${OPENCPN_VERSION}-Android-debug.apk"
+          # Negative checks ensure this really is arm64-only, not merely an APK
+          # where the 32-bit core build happened to be skipped.
+          if unzip -l "$APK" | grep -q 'lib/armeabi-v7a/'; then
+            echo "APK unexpectedly contains armeabi-v7a native libraries." >&2
+            unzip -l "$APK" | grep 'lib/armeabi-v7a/' >&2 || true
+            exit 1
+          fi
+          if unzip -l "$APK" | grep -qE 'assets/.+\.so32([[:space:]]|$)'; then
+            echo "APK unexpectedly contains 32-bit plugin payloads." >&2
+            unzip -l "$APK" | grep -E 'assets/.+\.so32([[:space:]]|$)' >&2 || true
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/OpenCPN-${OPENCPN_VERSION}-Android-arm64-debug.apk"
           cp "$APK" "$OUT"
           echo "path=$OUT" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$OUT")" >> "$GITHUB_OUTPUT"
@@ -338,17 +410,18 @@ jobs:
         run: |
           set -euxo pipefail
 
-          RELEASE_TAG="opencpn-android-${OPENCPN_TAG}"
-          TITLE="OpenCPN ${OPENCPN_VERSION} Android"
-          NOTES=$(cat <<EOF
-          Unofficial, debug-signed Android build of OpenCPN ${OPENCPN_TAG}.
+          RELEASE_TAG="opencpn-android-${OPENCPN_TAG}-arm64"
+          TITLE="OpenCPN ${OPENCPN_VERSION} Android arm64"
+          NOTES=$(cat <<EOF_NOTES
+          Unofficial, debug-signed arm64-only Android build of OpenCPN ${OPENCPN_TAG}.
 
           OpenCPN source: https://github.com/OpenCPN/OpenCPN/tree/${OPENCPN_TAG}
           Android packaging: https://github.com/bdbcat/OpenCPN-Android/commit/${ANDROID_COMMIT}
           APK: ${APK_NAME}
+          ABI: arm64-v8a only
 
           This APK is debug-signed by GitHub Actions. It is not signed with the official OpenCPN/Google Play signing key.
-          EOF
+          EOF_NOTES
           )
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
