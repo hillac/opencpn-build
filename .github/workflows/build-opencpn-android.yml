@@ -111,6 +111,8 @@ jobs:
           TOOL_BASE="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
           test -x "$TOOL_BASE/bin/armv7a-linux-androideabi21-clang++"
           test -x "$TOOL_BASE/bin/aarch64-linux-android21-clang++"
+          test -x "$TOOL_BASE/bin/llvm-ar"
+          test -x "$TOOL_BASE/bin/llvm-ranlib"
 
           # Newer GNU patch versions can strip the const-qualifier and function
           # body from the EraseMember template member function in rapidjson's
@@ -140,6 +142,8 @@ jobs:
 
             cmake -S "$OCPN_SRC" -B "$OCPN_SRC/$build_dir" \
               -DCMAKE_BUILD_TYPE=Release \
+              "-DCMAKE_AR:FILEPATH=$TOOL_BASE/bin/llvm-ar" \
+              "-DCMAKE_RANLIB:FILEPATH=$TOOL_BASE/bin/llvm-ranlib" \
               "-DOCPN_TARGET_TUPLE:STRING=$target_tuple" \
               -DOCPN_BUILD_SAMPLE=ON \
               -Dtool_base="$TOOL_BASE"
