@@ -1,4 +1,4 @@
-name: Build and release OpenCPN Android arm64 (no Firebase, v8)
+name: Build and release OpenCPN Android arm64 (no Firebase, v9)
 
 on:
   workflow_dispatch:
@@ -601,12 +601,26 @@ jobs:
           # These are produced by upstream Gradle preBuild copy tasks, so the
           # correct place to assert them is the final APK, not the pre-Gradle
           # source tree.
-          for required in             'assets/files/license.txt'             'assets/files/Configs/configs.xml'             'assets/files/styles/qtstylesheet.qss'             'assets/files/s57data/chartsymbols.xml'             'assets/files/gshhs/poly-c-1.dat'; do
+          # Validate immutable shared-data assets which must be shipped in the
+          # APK. Do NOT require Configs/configs.xml here: OpenCPN's ConfigMgr
+          # uses that under the writable per-user PrivateDataDir/Configs tree.
+          # It is runtime state, not a required APK asset.
+          for required in \
+            'assets/files/license.txt' \
+            'assets/files/styles/qtstylesheet.qss' \
+            'assets/files/s57data/chartsymbols.xml' \
+            'assets/files/gshhs/poly-c-1.dat'; do
             if ! grep -Fxq "$required" "$ZIPLIST"; then
-              echo "Final APK is missing required OpenCPN runtime asset: $required" >&2
+              echo "Final APK is missing required OpenCPN shared-data asset: $required" >&2
               exit 1
             fi
           done
+
+          if grep -Fxq 'assets/files/Configs/configs.xml' "$ZIPLIST"; then
+            echo "Note: APK also contains Configs/configs.xml."
+          else
+            echo "Note: Configs/configs.xml is not packaged; this is allowed because it is per-user runtime state."
+          fi
 
           if ! grep -Eq '^assets/files/locale/[^/]+/LC_MESSAGES/opencpn\.mo$' "$ZIPLIST"; then
             echo "APK contains no core OpenCPN opencpn.mo catalog." >&2
