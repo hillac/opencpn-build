@@ -367,18 +367,39 @@ jobs:
               if count != 1:
                   raise SystemExit(f"Could not remove {label} dependency")
 
+          # QtActivity has a minimal direct Firebase Analytics integration:
+          # one import, one member field and one getInstance() call. Remove these
+          # together with the SDK dependencies. There are no analytics event
+          # calls, so this does not alter OpenCPN application control flow.
+          qt_activity = (
+              Path(os.environ["ANDROID_SRC"])
+              / "app" / "src" / "main" / "java"
+              / "org" / "qtproject" / "qt5" / "android" / "bindings" / "QtActivity.java"
+          )
+          java = qt_activity.read_text()
+
+          java_patterns = (
+              (r'^\s*import\s+com\.google\.firebase\.analytics\.FirebaseAnalytics;\s*$', "FirebaseAnalytics import"),
+              (r'^\s*private\s+FirebaseAnalytics\s+mFirebaseAnalytics;\s*$', "FirebaseAnalytics member"),
+              (r'^\s*mFirebaseAnalytics\s*=\s*FirebaseAnalytics\.getInstance\(this\);\s*$', "FirebaseAnalytics initialization"),
+          )
+          for pattern, label in java_patterns:
+              java, count = re.subn(pattern, "", java, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove {label} from {qt_activity}")
+
+          qt_activity.write_text(java)
           root_gradle.write_text(root)
           app_gradle.write_text(app)
           PY_FIREBASE
 
           rm -f "$ANDROID_SRC/app/google-services.json"
 
-          # Fail early if the selected OpenCPN-Android revision starts using
-          # Firebase directly from application source code. In that case merely
-          # removing the Gradle dependencies would no longer be sufficient.
+          # After source and dependency patching, no Firebase reference should
+          # remain anywhere in the application Java/Kotlin source or Gradle files.
           if grep -RnsE 'com\.google\.firebase|Firebase(Crashlytics|Analytics|App)' \
             "$ANDROID_SRC/app/src/main/java" "$ANDROID_SRC/app/src/main/kotlin" 2>/dev/null; then
-            echo "OpenCPN-Android source contains direct Firebase API usage; refusing incomplete Firebase removal." >&2
+            echo "Firebase API reference remains in application source after patching." >&2
             exit 1
           fi
 
