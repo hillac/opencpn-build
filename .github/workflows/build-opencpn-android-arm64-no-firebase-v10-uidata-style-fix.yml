@@ -1,0 +1,826 @@
+name: Build and release OpenCPN Android arm64 (no Firebase, v10 uidata style fix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencpn_tag:
+        description: "OpenCPN stable release tag, for example Release_5.14.0"
+        required: true
+        default: "Release_5.14.0"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: opencpn-android-arm64-${{ inputs.opencpn_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      NDK_VERSION: "26.1.10909125"
+      BUILD_TOOLS_VERSION: "35.0.0"
+      COMPILE_SDK: "35"
+      OPENCPN_TAG: ${{ inputs.opencpn_tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gettext git ninja-build unzip zip python3-pip
+
+          # Pin CMake to the version which is known to configure this exact
+          # OpenCPN 5.14 Android dependency stack successfully. GitHub runner
+          # images are mutable; relying on whichever CMake happens to be on the
+          # image makes FetchContent/legacy CMake behavior non-reproducible.
+          python3 -m pip install --user --upgrade "cmake==3.31.6"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cmake" --version
+          "$HOME/.local/bin/cmake" --version | grep -Fq 'cmake version 3.31.6'
+
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}"
+
+      - name: Resolve source versions
+        id: versions
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if [[ ! "$OPENCPN_TAG" =~ ^Release_([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Only stable OpenCPN tags such as Release_5.14.0 are supported." >&2
+            exit 1
+          fi
+          OPENCPN_VERSION="${BASH_REMATCH[1]}"
+
+          WORK="$RUNNER_TEMP/opencpn-android-build"
+          OCPN_SRC="$WORK/OpenCPN"
+          ANDROID_SRC="$WORK/OpenCPN-Android"
+          COMMON_SRC="$WORK/OCPNAndroidCommon"
+          mkdir -p "$WORK"
+
+          git clone --depth 1 --branch "$OPENCPN_TAG" \
+            https://github.com/OpenCPN/OpenCPN.git "$OCPN_SRC"
+
+          # Full history is intentional. Select the newest Android packaging
+          # commit whose versionName matches the requested OpenCPN release.
+          git clone https://github.com/bdbcat/OpenCPN-Android.git "$ANDROID_SRC"
+          ANDROID_COMMIT=""
+          while read -r sha; do
+            if git -C "$ANDROID_SRC" show "$sha:app/build.gradle" 2>/dev/null \
+              | grep -Fq "versionName \"$OPENCPN_VERSION\""; then
+              ANDROID_COMMIT="$sha"
+              break
+            fi
+          done < <(git -C "$ANDROID_SRC" rev-list --first-parent master)
+
+          if [[ -z "$ANDROID_COMMIT" ]]; then
+            echo "No OpenCPN-Android packaging commit found for version $OPENCPN_VERSION." >&2
+            exit 1
+          fi
+          git -C "$ANDROID_SRC" checkout --detach "$ANDROID_COMMIT"
+
+          # Prebuilt Qt Android runtime used by the APK packager.
+          git clone --depth 1 https://github.com/bdbcat/OCPNAndroidCommon.git "$COMMON_SRC"
+
+          {
+            echo "version=$OPENCPN_VERSION"
+            echo "work=$WORK"
+            echo "ocpn_src=$OCPN_SRC"
+            echo "android_src=$ANDROID_SRC"
+            echo "common_src=$COMMON_SRC"
+            echo "android_commit=$ANDROID_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build OpenCPN native library for Android arm64
+        shell: bash
+        env:
+          OCPN_SRC: ${{ steps.versions.outputs.ocpn_src }}
+        run: |
+          set -euxo pipefail
+
+          TOOL_BASE="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
+          test -x "$TOOL_BASE/bin/aarch64-linux-android21-clang++"
+          test -x "$TOOL_BASE/bin/llvm-ar"
+          test -x "$TOOL_BASE/bin/llvm-ranlib"
+          test -x "$TOOL_BASE/bin/llvm-strip"
+
+          # OpenCPN 5.14.0 hard-codes aarch64-linux-android-ar for arm64.
+          # That binary does not exist in NDK 26. Patch the toolchain source
+          # itself before configure so CMake cannot restore the obsolete tool.
+          OCPN_TOOLCHAIN="$OCPN_SRC/buildandroid/build_android.cmake"
+          python3 - "$OCPN_TOOLCHAIN" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = "set(CMAKE_AR ${tool_base}/bin/aarch64-linux-android-ar)"
+          new = "set(CMAKE_AR ${tool_base}/bin/llvm-ar)"
+
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one obsolete arm64 archiver setting in {path}, found {count}"
+              )
+
+          text = text.replace(old, new, 1)
+          lines = text.splitlines()
+
+          # Only the arm64 branch matters in this workflow. Add an explicit
+          # LLVM ranlib immediately after the arm64 llvm-ar setting.
+          arm64_marker = "set(CMAKE_C_COMPILER ${tool_base}/bin/aarch64-linux-android21-clang)"
+          try:
+              arm64_start = next(i for i, line in enumerate(lines) if line.strip() == arm64_marker)
+          except StopIteration:
+              raise SystemExit(f"Could not locate arm64 toolchain branch in {path}")
+
+          ar_index = next(
+              (i for i in range(arm64_start, len(lines))
+               if lines[i].strip() == "set(CMAKE_AR ${tool_base}/bin/llvm-ar)"),
+              None,
+          )
+          if ar_index is None:
+              raise SystemExit(f"Could not locate patched arm64 llvm-ar setting in {path}")
+
+          indent = lines[ar_index][:len(lines[ar_index]) - len(lines[ar_index].lstrip())]
+          if ar_index + 1 >= len(lines) or "CMAKE_RANLIB" not in lines[ar_index + 1]:
+              lines.insert(ar_index + 1, indent + "set(CMAKE_RANLIB ${tool_base}/bin/llvm-ranlib)")
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+          grep -nE 'CMAKE_(AR|RANLIB)' "$OCPN_TOOLCHAIN"
+          if grep -Fq 'aarch64-linux-android-ar' "$OCPN_TOOLCHAIN"; then
+            echo "Obsolete NDK arm64 archiver still present in OpenCPN toolchain." >&2
+            exit 1
+          fi
+
+          # Avoid OpenCPN's legacy RapidJSON patch path entirely. Supply the
+          # exact pristine RapidJSON v1.1.0 tree via its supported RAPIDJSON
+          # find_path input instead of letting FetchContent download and patch it.
+          RAPIDJSON_COMMIT="f54b0e47a08782a6131cc3d60f94d038fa6e0a51"
+          RAPIDJSON_SRC="$RUNNER_TEMP/rapidjson-v1.1.0"
+          git clone --depth 1 --branch v1.1.0 \
+            https://github.com/Tencent/rapidjson.git "$RAPIDJSON_SRC"
+          test "$(git -C "$RAPIDJSON_SRC" rev-parse HEAD)" = "$RAPIDJSON_COMMIT"
+
+          RAPIDJSON_DOC="$RAPIDJSON_SRC/include/rapidjson/document.h"
+          test -s "$RAPIDJSON_DOC"
+          grep -Fq '#ifndef RAPIDJSON_DOCUMENT_H_' "$RAPIDJSON_DOC"
+          grep -Fq '#endif // RAPIDJSON_DOCUMENT_H_' "$RAPIDJSON_DOC"
+          grep -Fq 'bool EraseMember(const GenericValue<EncodingType, SourceAllocator>& name) const {' "$RAPIDJSON_DOC"
+
+          BUILD_DIR="$OCPN_SRC/build_android_64_cci_22b"
+
+          # OpenCPN 5.14 uses CMake FetchContent plus an upstream patch stack
+          # for shapelib. A prior successful build of this exact tag proves the
+          # patch set is valid, but a fetched source tree can occasionally be
+          # left malformed during configure. Production CI should never reuse a
+          # half-patched dependency tree. Configure from a completely fresh
+          # binary/FetchContent directory and retry the dependency acquisition
+          # if, and only if, configure itself fails.
+          configure_ok=0
+          for attempt in 1 2 3; do
+            echo "OpenCPN configure attempt $attempt/3"
+            rm -rf "$BUILD_DIR"
+
+            if cmake -S "$OCPN_SRC" -B "$BUILD_DIR" \
+              -DCMAKE_BUILD_TYPE=Release \
+              "-DOCPN_TARGET_TUPLE:STRING=Android-arm64;16;arm64" \
+              -DOCPN_BUILD_SAMPLE=ON \
+              -Dtool_base="$TOOL_BASE" \
+              -DRAPIDJSON:PATH="$RAPIDJSON_SRC/include/rapidjson"; then
+              configure_ok=1
+              break
+            fi
+
+            echo "::warning::OpenCPN CMake configure attempt $attempt failed."
+
+            # Preserve useful evidence before the next clean attempt. The
+            # failure seen in practice is a syntactically damaged patched
+            # shapelib CMakeLists.txt.
+            SHAPE_CMAKE="$BUILD_DIR/_deps/shapelib_src-src/CMakeLists.txt"
+            if [[ -f "$SHAPE_CMAKE" ]]; then
+              echo "shapelib CMakeLists.txt sha256:"
+              sha256sum "$SHAPE_CMAKE" || true
+              echo "shapelib CMakeLists.txt tail:"
+              tail -80 "$SHAPE_CMAKE" || true
+            fi
+
+            rm -rf "$BUILD_DIR"
+            sleep $((attempt * 2))
+          done
+
+          if (( configure_ok == 0 )); then
+            echo "OpenCPN CMake configuration failed from three clean dependency trees." >&2
+            exit 1
+          fi
+
+          # The OpenCPN 5.14 Android build was previously observed working with
+          # CMake 3.31.6; fail if runner PATH drifted despite the pin above.
+          cmake --version
+          cmake --version | grep -Fq 'cmake version 3.31.6'
+
+          # Guard both workarounds before compiling.
+          grep -Fq "${RAPIDJSON_SRC}/include" "$BUILD_DIR/CMakeCache.txt"
+          test ! -d "$BUILD_DIR/_deps/rapidjson_src-src"
+
+          # A successful configure must have a complete shapelib source tree
+          # and generated shp target. These checks catch a half-patched
+          # FetchContent tree before the expensive native compile starts.
+          SHAPE_SRC="$BUILD_DIR/_deps/shapelib_src-src"
+          test -s "$SHAPE_SRC/CMakeLists.txt"
+          test -s "$SHAPE_SRC/shapefil.h"
+          test -s "$SHAPE_SRC/shpopen.c"
+          test -s "$SHAPE_SRC/dbfopen.c"
+          test -d "$BUILD_DIR/libs/shapelib/shapelib_dir/CMakeFiles/shp.dir"
+
+          if grep -RqsF 'aarch64-linux-android-ar' \
+            "$BUILD_DIR/CMakeFiles" \
+            "$BUILD_DIR/_deps/lunasvg-build/CMakeFiles"; then
+            echo "Generated build rules still reference obsolete aarch64-linux-android-ar." >&2
+            grep -RnsF 'aarch64-linux-android-ar' \
+              "$BUILD_DIR/CMakeFiles" \
+              "$BUILD_DIR/_deps/lunasvg-build/CMakeFiles" || true
+            exit 1
+          fi
+
+          cmake --build "$BUILD_DIR" --target lunasvg --parallel 2
+          cmake --build "$BUILD_DIR" --parallel 2
+          test -s "$BUILD_DIR/libgorp.so"
+
+          file "$BUILD_DIR/libgorp.so" | tee /tmp/gorp64.txt
+          grep -q 'ELF 64-bit' /tmp/gorp64.txt
+          grep -Eq 'ARM aarch64|ARM64|aarch64' /tmp/gorp64.txt
+
+
+      - name: Prepare arm64-only Android packaging project
+        shell: bash
+        env:
+          OCPN_SRC: ${{ steps.versions.outputs.ocpn_src }}
+          ANDROID_SRC: ${{ steps.versions.outputs.android_src }}
+          COMMON_SRC: ${{ steps.versions.outputs.common_src }}
+        run: |
+          set -euxo pipefail
+
+          OCPN_SRC="$OCPN_SRC" ANDROID_SRC="$ANDROID_SRC" COMMON_SRC="$COMMON_SRC" python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ["ANDROID_SRC"]) / "app" / "build.gradle"
+          text = path.read_text()
+
+          # Replace maintainer-local roots.
+          replacements = {
+              "Qt_Base": str(Path(os.environ["COMMON_SRC"]) / "qt5"),
+              "OCPN_Base": os.environ["OCPN_SRC"],
+          }
+          for name, value in replacements.items():
+              pattern = rf'def\s+{re.escape(name)}\s*=\s*"[^"]*"'
+              replacement = f'def {name} = "{value}"'
+              text, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(f"Could not patch {name} in {path}")
+
+          # Make shared resources use the arm64 build/runtime. These variables
+          # are also referenced by locale and Qt-JAR copy tasks.
+          text, count = re.subn(
+              r'def\s+Qt_Build\s*=\s*"[^"]*"',
+              'def Qt_Build = "build_arm64_O3"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not redirect Qt_Build to arm64")
+
+          text, count = re.subn(
+              r'def\s+OCPN_Build\s*=\s*"[^"]*"',
+              'def OCPN_Build = "build_android_64_cci_22b"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not redirect OCPN_Build to arm64")
+
+          # Restrict both default and debug Android configurations to arm64-v8a.
+          text, count = re.subn(
+              r"ndk\.abiFilters\s+['\"]armeabi-v7a['\"]\s*,\s*['\"]arm64-v8a['\"]",
+              "ndk.abiFilters 'arm64-v8a'",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not patch defaultConfig ABI filters")
+
+          text, count = re.subn(
+              r'^\s*abiFilters\s+["\']armeabi-v7a["\']\s*$',
+              '',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Could not remove debug armeabi-v7a ABI filter")
+
+          # Disable every active preBuild dependency that produces or consumes
+          # 32-bit native code. Leave data-only and all 64-bit tasks enabled.
+          disable_tasks = {
+              "copyWMM_PIFiles",
+              "copyDNLDR_PIFiles",
+              "copyGRIB_PIFiles",
+              "copyDASHBOARD_PIFiles",
+              "copyQTLibs_armeabi_v7a",
+              "copyOCPN_CORE",
+              "copySERVERFiles32",
+          }
+          for task in sorted(disable_tasks):
+              pattern = rf'^(\s*)preBuild\.dependsOn\({re.escape(task)}\)\s*$'
+              text, count = re.subn(
+                  pattern,
+                  rf'\1// arm64-only: preBuild.dependsOn({task})',
+                  text,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(f"Could not disable active 32-bit task {task}")
+
+          path.write_text(text)
+          PY
+
+          # Remove any checked-in/stale 32-bit payload before Gradle sees it.
+          rm -rf "$ANDROID_SRC/app/src/main/jniLibs/armeabi-v7a"
+          rm -rf "$ANDROID_SRC/app/src/main/assets/files/Qtplugins/armeabi-v7a"
+          find "$ANDROID_SRC/app/src/main/assets/files/plugins" -type f -name '*.so32' -delete 2>/dev/null || true
+
+          # The upstream Play Store package enables Firebase Analytics and
+          # Crashlytics and expects the maintainer's private google-services.json.
+          # This unofficial build has no Firebase project, so remove Firebase
+          # completely instead of generating invalid credentials.
+          ANDROID_SRC="$ANDROID_SRC" python3 <<'PY_FIREBASE'
+          import os
+          import re
+          from pathlib import Path
+
+          root_gradle = Path(os.environ["ANDROID_SRC"]) / "build.gradle"
+          app_gradle = Path(os.environ["ANDROID_SRC"]) / "app" / "build.gradle"
+
+          root = root_gradle.read_text()
+          app = app_gradle.read_text()
+
+          # Remove the two Firebase-related plugin declarations from the root
+          # project. Keep the Android application plugin untouched.
+          for plugin_id in (
+              "com.google.firebase.crashlytics",
+              "com.google.gms.google-services",
+          ):
+              pattern = rf"^\s*id ['\"]{re.escape(plugin_id)}['\"] version ['\"][^'\"]+['\"] apply false\s*$"
+              root, count = re.subn(pattern, "", root, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove root Gradle plugin {plugin_id}")
+
+          # Remove the plugins which generate Firebase resources and Crashlytics
+          # build metadata from the app module.
+          for plugin_id in (
+              "com.google.firebase.crashlytics",
+              "com.google.gms.google-services",
+          ):
+              pattern = rf"^\s*id ['\"]{re.escape(plugin_id)}['\"]\s*$"
+              app, count = re.subn(pattern, "", app, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove app Gradle plugin {plugin_id}")
+
+          # Remove Firebase's BoM and every Firebase runtime dependency used by
+          # this packaging project. Without these libraries, their manifest
+          # ContentProviders cannot be merged into the APK.
+          firebase_dependency_patterns = (
+              r'^\s*implementation\s*\(\s*platform\(\s*["\']com\.google\.firebase:firebase-bom:[^"\']+["\']\s*\)\s*\)\s*$',
+              r'^\s*implementation\s+["\']com\.google\.firebase:firebase-analytics(?::[^"\']+)?["\']\s*$',
+              r'^\s*implementation\s+["\']com\.google\.firebase:firebase-crashlytics(?::[^"\']+)?["\']\s*$',
+              r'^\s*implementation\s+["\']com\.google\.firebase:firebase-crashlytics-ndk(?::[^"\']+)?["\']\s*$',
+          )
+          labels = (
+              "Firebase BoM",
+              "Firebase Analytics",
+              "Firebase Crashlytics",
+              "Firebase Crashlytics NDK",
+          )
+          for pattern, label in zip(firebase_dependency_patterns, labels):
+              app, count = re.subn(pattern, "", app, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove {label} dependency")
+
+          # QtActivity has a minimal direct Firebase Analytics integration:
+          # one import, one member field and one getInstance() call. Remove these
+          # together with the SDK dependencies. There are no analytics event
+          # calls, so this does not alter OpenCPN application control flow.
+          qt_activity = (
+              Path(os.environ["ANDROID_SRC"])
+              / "app" / "src" / "main" / "java"
+              / "org" / "qtproject" / "qt5" / "android" / "bindings" / "QtActivity.java"
+          )
+          java = qt_activity.read_text()
+
+          java_patterns = (
+              (r'^\s*import\s+com\.google\.firebase\.analytics\.FirebaseAnalytics;\s*$', "FirebaseAnalytics import"),
+              (r'^\s*private\s+FirebaseAnalytics\s+mFirebaseAnalytics;\s*$', "FirebaseAnalytics member"),
+              (r'^\s*mFirebaseAnalytics\s*=\s*FirebaseAnalytics\.getInstance\(this\);\s*$', "FirebaseAnalytics initialization"),
+          )
+          for pattern, label in java_patterns:
+              java, count = re.subn(pattern, "", java, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove {label} from {qt_activity}")
+
+          qt_activity.write_text(java)
+          root_gradle.write_text(root)
+          app_gradle.write_text(app)
+          PY_FIREBASE
+
+          rm -f "$ANDROID_SRC/app/google-services.json"
+
+          # -----------------------------------------------------------------
+          # Stage the release-matched core OpenCPN locale catalogs explicitly.
+          #
+          # The upstream Android Gradle task copyLocaleFiles is NO-SOURCE in
+          # this arm64-only layout because it historically consumes generated
+          # .mo files from the native build directory. OpenCPN's CMake install
+          # rules likewise assume those generated .mo files already exist.
+          #
+          # Do not run the desktop-style CMake install phase here. Instead,
+          # compile the exact release tag's core PO files directly into the
+          # Android asset layout OpenCPN expects:
+          #   locale/<locale>/LC_MESSAGES/opencpn.mo
+          # -----------------------------------------------------------------
+          ASSET_FILES="$ANDROID_SRC/app/src/main/assets/files"
+
+          # -----------------------------------------------------------------
+          # Stage OpenCPN's core UI style definition and its raster backing
+          # graphics from the exact OpenCPN release source.
+          #
+          # StyleManager initializes from <SharedDataDir>/uidata and searches
+          # for style*.xml.  It cannot become valid without a parsed style XML
+          # containing a <graphics-file>, and SetStyle() requires that graphics
+          # file to exist and load as PNG even when SVG toolbar icons are used.
+          #
+          # The Android packaging tree already supplies many uidata SVG files,
+          # but it does not reliably copy these root style files in the
+          # arm64-only layout.  Use the canonical source files rather than
+          # synthesizing or editing them.
+          # -----------------------------------------------------------------
+          BITMAP_SRC="$OCPN_SRC/src/bitmaps"
+          UIDATA_DST="$ASSET_FILES/uidata"
+          STYLE_XML="$BITMAP_SRC/styles.xml"
+
+          test -s "$STYLE_XML"
+          mkdir -p "$UIDATA_DST"
+          install -m 0644 "$STYLE_XML" "$UIDATA_DST/styles.xml"
+
+          # Parse the upstream XML and copy every raster graphics file it
+          # references. This stays correct if a release changes the style's
+          # graphics filename instead of hardcoding one assumed PNG.
+          STYLE_XML="$STYLE_XML" BITMAP_SRC="$BITMAP_SRC" UIDATA_DST="$UIDATA_DST" python3 <<'PY_STYLE'
+          import os
+          import shutil
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          style_xml = Path(os.environ["STYLE_XML"])
+          bitmap_src = Path(os.environ["BITMAP_SRC"])
+          uidata_dst = Path(os.environ["UIDATA_DST"])
+
+          root = ET.parse(style_xml).getroot()
+          if root.tag != "styles":
+              raise SystemExit(f"Unexpected styles.xml root: {root.tag!r}")
+
+          graphics = []
+          for node in root.iter("graphics-file"):
+              name = node.get("name")
+              if name:
+                  graphics.append(name)
+
+          graphics = sorted(set(graphics))
+          if not graphics:
+              raise SystemExit("OpenCPN styles.xml contains no <graphics-file> entries")
+
+          for name in graphics:
+              # StyleManager resolves graphics-file relative to uidata.
+              # Upstream styles.xml uses files from src/bitmaps.
+              source = bitmap_src / name
+              if not source.is_file() or source.stat().st_size == 0:
+                  raise SystemExit(
+                      f"styles.xml references missing/empty graphics file: {source}"
+                  )
+              destination = uidata_dst / name
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, destination)
+              print(f"Staged style graphics: {name}")
+
+          # These root UI bitmaps are part of OpenCPN's canonical uidata set.
+          # Copy them when present in this release.  They are not substitutes
+          # for styles.xml; they are ancillary UI resources used by core UI.
+          for name in (
+              "iconAll.png",
+              "iconMinimum.png",
+              "iconRMinus.png",
+              "iconRPlus.png",
+              "iconStandard.png",
+          ):
+              source = bitmap_src / name
+              if source.is_file() and source.stat().st_size:
+                  shutil.copy2(source, uidata_dst / name)
+                  print(f"Staged core UI bitmap: {name}")
+
+          print("Style graphics required by styles.xml:", ", ".join(graphics))
+          PY_STYLE
+
+          test -s "$UIDATA_DST/styles.xml"
+          grep -q '<styles' "$UIDATA_DST/styles.xml"
+          grep -q '<graphics-file' "$UIDATA_DST/styles.xml"
+
+          echo "Staged OpenCPN core style payload:"
+          find "$UIDATA_DST" -maxdepth 1 -type f -printf '%f\n' | sort
+
+          mkdir -p "$ASSET_FILES/locale"
+
+          compiled_catalogs=0
+          shopt -s nullglob
+          for po in "$OCPN_SRC"/po/opencpn_*.po; do
+            base="$(basename "$po" .po)"
+            locale="${base#opencpn_}"
+            [[ -n "$locale" ]] || continue
+
+            dest="$ASSET_FILES/locale/$locale/LC_MESSAGES"
+            mkdir -p "$dest"
+
+            # Translation catalogs are optional runtime resources. Some
+            # upstream Release_5.14.0 PO files are malformed enough that even
+            # ordinary msgfmt rejects them (for example th_TH). Do not make the
+            # Android application build depend on every Crowdin catalog being
+            # valid. Compile each locale independently and omit only failures;
+            # gettext will fall back to untranslated source strings for an
+            # unavailable locale.
+            if msgfmt -o "$dest/opencpn.mo" "$po"; then
+              if [[ -s "$dest/opencpn.mo" ]] && msgunfmt "$dest/opencpn.mo" >/dev/null; then
+                compiled_catalogs=$((compiled_catalogs + 1))
+              else
+                echo "::warning file=$po::Generated catalog is empty or unreadable; omitting locale $locale"
+                rm -f "$dest/opencpn.mo"
+              fi
+            else
+              echo "::warning file=$po::Upstream PO catalog failed msgfmt; omitting locale $locale"
+              rm -f "$dest/opencpn.mo"
+            fi
+          done
+          shopt -u nullglob
+
+          if (( compiled_catalogs == 0 )); then
+            echo "No usable core OpenCPN catalogs could be compiled." >&2
+            exit 1
+          fi
+
+          # en_GB is known-good in Release_5.14.0 and gives us a deterministic
+          # assertion that core catalog staging actually worked.
+          if [[ ! -s "$ASSET_FILES/locale/en_GB/LC_MESSAGES/opencpn.mo" ]]; then
+            echo "Required sanity-check catalog en_GB/opencpn.mo was not generated." >&2
+            exit 1
+          fi
+
+          echo "Core OpenCPN catalogs successfully compiled: $compiled_catalogs"
+          echo "Packaged core locales:"
+          find "$ASSET_FILES/locale" -type f -path '*/LC_MESSAGES/opencpn.mo' -print | sort
+
+          # Do not validate the rest of app/src/main/assets/files yet.
+          # In the upstream Android packaging project, Gradle preBuild copy
+          # tasks populate runtime assets such as license.txt, Configs,
+          # styles, S57 data and GSHHS.  This preparation step runs before
+          # Gradle, so those files are legitimate build outputs and may not
+          # exist here yet.  They are validated from the final APK below.
+
+          CORE_MO_COUNT="$(find "$ASSET_FILES/locale" -type f -path '*/LC_MESSAGES/opencpn.mo' | wc -l)"
+          echo "Core OpenCPN catalogs staged in APK assets: $CORE_MO_COUNT"
+          test "$CORE_MO_COUNT" -gt 0
+          find "$ASSET_FILES/locale" -type f -path '*/LC_MESSAGES/opencpn.mo' -print | sort | head -100
+
+          # After source and dependency patching, no Firebase reference should
+          # remain anywhere in the application Java/Kotlin source or Gradle files.
+          if grep -RnsE 'com\.google\.firebase|Firebase(Crashlytics|Analytics|App)' \
+            "$ANDROID_SRC/app/src/main/java" "$ANDROID_SRC/app/src/main/kotlin" 2>/dev/null; then
+            echo "Firebase API reference remains in application source after patching." >&2
+            exit 1
+          fi
+
+          ! grep -REn 'com\.google\.firebase|com\.google\.gms\.google-services|firebase-(bom|analytics|crashlytics)' \
+            "$ANDROID_SRC/build.gradle" "$ANDROID_SRC/app/build.gradle"
+
+          GRADLE_FILE="$ANDROID_SRC/app/build.gradle"
+          grep -Fq "ndk.abiFilters 'arm64-v8a'" "$GRADLE_FILE"
+          grep -Fq "def Qt_Build = \"build_arm64_O3\"" "$GRADLE_FILE"
+          grep -Fq "def OCPN_Build = \"build_android_64_cci_22b\"" "$GRADLE_FILE"
+          ! grep -Eq '^\s*preBuild\.dependsOn\((copyWMM_PIFiles|copyDNLDR_PIFiles|copyGRIB_PIFiles|copyDASHBOARD_PIFiles|copyQTLibs_armeabi_v7a|copyOCPN_CORE|copySERVERFiles32)\)\s*$' "$GRADLE_FILE"
+
+          test -s "$COMMON_SRC/qt5/build_arm64_O3/qtbase/jar/QtAndroid.jar"
+          test -s "$COMMON_SRC/qt5/build_arm64_O3/qtbase/lib/libQt5Core.so"
+          test -s "$OCPN_SRC/build_android_64_cci_22b/libgorp.so"
+
+      - name: Build installable arm64 APK
+        id: apk
+        shell: bash
+        env:
+          ANDROID_SRC: ${{ steps.versions.outputs.android_src }}
+          OPENCPN_VERSION: ${{ steps.versions.outputs.version }}
+        run: |
+          set -euxo pipefail
+          cd "$ANDROID_SRC"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK" ]]; then
+            echo "Gradle completed but no debug APK was found." >&2
+            exit 1
+          fi
+
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          AAPT="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/aapt"
+          "$APKSIGNER" verify --verbose "$APK"
+          "$AAPT" dump badging "$APK" | grep -q "package: name='org.opencpn.opencpn'"
+          "$AAPT" dump badging "$APK" | grep -q "versionName='$OPENCPN_VERSION'"
+
+          # Firebase must be completely absent. The previous build crashed in
+          # FirebaseInitProvider before OpenCPN's Activity was even created.
+          if "$AAPT" dump xmltree "$APK" AndroidManifest.xml | \
+            grep -q 'com.google.firebase.provider.FirebaseInitProvider'; then
+            echo "APK unexpectedly contains FirebaseInitProvider." >&2
+            exit 1
+          fi
+          if "$AAPT" dump xmltree "$APK" AndroidManifest.xml | grep -q 'com.google.firebase'; then
+            echo "APK unexpectedly contains Firebase manifest components." >&2
+            "$AAPT" dump xmltree "$APK" AndroidManifest.xml | grep 'com.google.firebase' >&2 || true
+            exit 1
+          fi
+
+          # Validate the early-startup data tree inside the APK itself rather
+          # than trusting Gradle task output.  The previous failing installation
+          # had plugin .mo files but no core opencpn.mo.
+          ZIPLIST="$RUNNER_TEMP/apk-files.txt"
+          unzip -Z1 "$APK" > "$ZIPLIST"
+
+          # These are produced by upstream Gradle preBuild copy tasks, so the
+          # correct place to assert them is the final APK, not the pre-Gradle
+          # source tree.
+          # Validate immutable shared-data assets which must be shipped in the
+          # APK. Do NOT require Configs/configs.xml here: OpenCPN's ConfigMgr
+          # uses that under the writable per-user PrivateDataDir/Configs tree.
+          # It is runtime state, not a required APK asset.
+          for required in \
+            'assets/files/license.txt' \
+            'assets/files/styles/qtstylesheet.qss' \
+            'assets/files/s57data/chartsymbols.xml' \
+            'assets/files/gshhs/poly-c-1.dat'; do
+            if ! grep -Fxq "$required" "$ZIPLIST"; then
+              echo "Final APK is missing required OpenCPN shared-data asset: $required" >&2
+              exit 1
+            fi
+          done
+
+          if grep -Fxq 'assets/files/Configs/configs.xml' "$ZIPLIST"; then
+            echo "Note: APK also contains Configs/configs.xml."
+          else
+            echo "Note: Configs/configs.xml is not packaged; this is allowed because it is per-user runtime state."
+          fi
+
+          # StyleManager cannot initialize without uidata/styles.xml and the
+          # raster graphics file(s) named by its <graphics-file> entries.
+          if ! grep -Fxq 'assets/files/uidata/styles.xml' "$ZIPLIST"; then
+            echo "Final APK is missing OpenCPN uidata/styles.xml." >&2
+            exit 1
+          fi
+
+          APK="$APK" python3 <<'PY_APK_STYLE'
+          import os
+          import zipfile
+          import xml.etree.ElementTree as ET
+
+          apk = os.environ["APK"]
+          style_path = "assets/files/uidata/styles.xml"
+
+          with zipfile.ZipFile(apk) as zf:
+              names = set(zf.namelist())
+              root = ET.fromstring(zf.read(style_path))
+              if root.tag != "styles":
+                  raise SystemExit(
+                      f"APK styles.xml has unexpected root {root.tag!r}"
+                  )
+
+              graphics = sorted(
+                  {
+                      node.get("name")
+                      for node in root.iter("graphics-file")
+                      if node.get("name")
+                  }
+              )
+              if not graphics:
+                  raise SystemExit(
+                      "APK styles.xml contains no <graphics-file> entries"
+                  )
+
+              missing = [
+                  f"assets/files/uidata/{name}"
+                  for name in graphics
+                  if f"assets/files/uidata/{name}" not in names
+              ]
+              if missing:
+                  raise SystemExit(
+                      "APK is missing style graphics referenced by styles.xml: "
+                      + ", ".join(missing)
+                  )
+
+              print("APK core style definition is complete.")
+              for name in graphics:
+                  print("  styles.xml graphics:", name)
+          PY_APK_STYLE
+
+          if ! grep -Eq '^assets/files/locale/[^/]+/LC_MESSAGES/opencpn\.mo$' "$ZIPLIST"; then
+            echo "APK contains no core OpenCPN opencpn.mo catalog." >&2
+            grep '^assets/files/locale/' "$ZIPLIST" >&2 || true
+            exit 1
+          fi
+
+          echo "Core OpenCPN catalogs packaged in APK:"
+          grep -E '^assets/files/locale/[^/]+/LC_MESSAGES/opencpn\.mo$' "$ZIPLIST" | sort
+
+          # Positive arm64 checks.
+          grep -Fxq 'lib/arm64-v8a/libgorp.so' "$ZIPLIST"
+          grep -Fxq 'lib/arm64-v8a/libQt5Core.so' "$ZIPLIST"
+
+          # Negative checks ensure this really is arm64-only, not merely an APK
+          # where the 32-bit core build happened to be skipped.
+          if unzip -l "$APK" | grep -q 'lib/armeabi-v7a/'; then
+            echo "APK unexpectedly contains armeabi-v7a native libraries." >&2
+            unzip -l "$APK" | grep 'lib/armeabi-v7a/' >&2 || true
+            exit 1
+          fi
+          if unzip -l "$APK" | grep -qE 'assets/.+\.so32([[:space:]]|$)'; then
+            echo "APK unexpectedly contains 32-bit plugin payloads." >&2
+            unzip -l "$APK" | grep -E 'assets/.+\.so32([[:space:]]|$)' >&2 || true
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/OpenCPN-${OPENCPN_VERSION}-Android-arm64-debug.apk"
+          cp "$APK" "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$OUT")" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          OPENCPN_VERSION: ${{ steps.versions.outputs.version }}
+          ANDROID_COMMIT: ${{ steps.versions.outputs.android_commit }}
+        run: |
+          set -euxo pipefail
+
+          RELEASE_TAG="opencpn-android-${OPENCPN_TAG}-arm64"
+          TITLE="OpenCPN ${OPENCPN_VERSION} Android arm64"
+          NOTES=$(cat <<EOF_NOTES
+          Unofficial, debug-signed arm64-only Android build of OpenCPN ${OPENCPN_TAG}. Firebase Analytics and Crashlytics are removed. Core OpenCPN gettext catalogs and the canonical uidata style definition/graphics are staged directly from the same release tag and packaged into the APK.
+
+          OpenCPN source: https://github.com/OpenCPN/OpenCPN/tree/${OPENCPN_TAG}
+          Android packaging: https://github.com/bdbcat/OpenCPN-Android/commit/${ANDROID_COMMIT}
+          APK: ${APK_NAME}
+          ABI: arm64-v8a only
+
+          This APK is debug-signed by GitHub Actions. It is not signed with the official OpenCPN/Google Play signing key.
+          EOF_NOTES
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK_PATH" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$APK_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi
