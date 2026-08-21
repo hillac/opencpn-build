@@ -310,39 +310,80 @@ jobs:
           rm -rf "$ANDROID_SRC/app/src/main/assets/files/Qtplugins/armeabi-v7a"
           find "$ANDROID_SRC/app/src/main/assets/files/plugins" -type f -name '*.so32' -delete 2>/dev/null || true
 
-          # google-services.json is private in the maintainer's build environment.
-          # A non-production placeholder lets the open-source debug APK build.
-          cat > "$ANDROID_SRC/app/google-services.json" <<'JSON'
-          {
-            "project_info": {
-              "project_number": "123456789000",
-              "project_id": "opencpn-local-ci",
-              "storage_bucket": "opencpn-local-ci.appspot.com"
-            },
-            "client": [
-              {
-                "client_info": {
-                  "mobilesdk_app_id": "1:123456789000:android:0000000000000000000000",
-                  "android_client_info": {
-                    "package_name": "org.opencpn.opencpn"
-                  }
-                },
-                "oauth_client": [],
-                "api_key": [
-                  {
-                    "current_key": "AIzaSyDUMMY_OPENCPN_LOCAL_CI_KEY_0000000"
-                  }
-                ],
-                "services": {
-                  "appinvite_service": {
-                    "other_platform_oauth_client": []
-                  }
-                }
-              }
-            ],
-            "configuration_version": "1"
-          }
-          JSON
+          # The upstream Play Store package enables Firebase Analytics and
+          # Crashlytics and expects the maintainer's private google-services.json.
+          # This unofficial build has no Firebase project, so remove Firebase
+          # completely instead of generating invalid credentials.
+          ANDROID_SRC="$ANDROID_SRC" python3 <<'PY_FIREBASE'
+          import os
+          import re
+          from pathlib import Path
+
+          root_gradle = Path(os.environ["ANDROID_SRC"]) / "build.gradle"
+          app_gradle = Path(os.environ["ANDROID_SRC"]) / "app" / "build.gradle"
+
+          root = root_gradle.read_text()
+          app = app_gradle.read_text()
+
+          # Remove the two Firebase-related plugin declarations from the root
+          # project. Keep the Android application plugin untouched.
+          for plugin_id in (
+              "com.google.firebase.crashlytics",
+              "com.google.gms.google-services",
+          ):
+              pattern = rf"^\s*id ['\"]{re.escape(plugin_id)}['\"] version ['\"][^'\"]+['\"] apply false\s*$"
+              root, count = re.subn(pattern, "", root, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove root Gradle plugin {plugin_id}")
+
+          # Remove the plugins which generate Firebase resources and Crashlytics
+          # build metadata from the app module.
+          for plugin_id in (
+              "com.google.firebase.crashlytics",
+              "com.google.gms.google-services",
+          ):
+              pattern = rf"^\s*id ['\"]{re.escape(plugin_id)}['\"]\s*$"
+              app, count = re.subn(pattern, "", app, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove app Gradle plugin {plugin_id}")
+
+          # Remove Firebase's BoM and every Firebase runtime dependency used by
+          # this packaging project. Without these libraries, their manifest
+          # ContentProviders cannot be merged into the APK.
+          firebase_dependency_patterns = (
+              r'^\s*implementation\s*\(\s*platform\(\s*["\']com\.google\.firebase:firebase-bom:[^"\']+["\']\s*\)\s*\)\s*$',
+              r'^\s*implementation\s+["\']com\.google\.firebase:firebase-analytics(?::[^"\']+)?["\']\s*$',
+              r'^\s*implementation\s+["\']com\.google\.firebase:firebase-crashlytics(?::[^"\']+)?["\']\s*$',
+              r'^\s*implementation\s+["\']com\.google\.firebase:firebase-crashlytics-ndk(?::[^"\']+)?["\']\s*$',
+          )
+          labels = (
+              "Firebase BoM",
+              "Firebase Analytics",
+              "Firebase Crashlytics",
+              "Firebase Crashlytics NDK",
+          )
+          for pattern, label in zip(firebase_dependency_patterns, labels):
+              app, count = re.subn(pattern, "", app, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not remove {label} dependency")
+
+          root_gradle.write_text(root)
+          app_gradle.write_text(app)
+          PY_FIREBASE
+
+          rm -f "$ANDROID_SRC/app/google-services.json"
+
+          # Fail early if the selected OpenCPN-Android revision starts using
+          # Firebase directly from application source code. In that case merely
+          # removing the Gradle dependencies would no longer be sufficient.
+          if grep -RnsE 'com\.google\.firebase|Firebase(Crashlytics|Analytics|App)' \
+            "$ANDROID_SRC/app/src/main/java" "$ANDROID_SRC/app/src/main/kotlin" 2>/dev/null; then
+            echo "OpenCPN-Android source contains direct Firebase API usage; refusing incomplete Firebase removal." >&2
+            exit 1
+          fi
+
+          ! grep -REn 'com\.google\.firebase|com\.google\.gms\.google-services|firebase-(bom|analytics|crashlytics)' \
+            "$ANDROID_SRC/build.gradle" "$ANDROID_SRC/app/build.gradle"
 
           GRADLE_FILE="$ANDROID_SRC/app/build.gradle"
           grep -Fq "ndk.abiFilters 'arm64-v8a'" "$GRADLE_FILE"
@@ -377,6 +418,19 @@ jobs:
           "$APKSIGNER" verify --verbose "$APK"
           "$AAPT" dump badging "$APK" | grep -q "package: name='org.opencpn.opencpn'"
           "$AAPT" dump badging "$APK" | grep -q "versionName='$OPENCPN_VERSION'"
+
+          # Firebase must be completely absent. The previous build crashed in
+          # FirebaseInitProvider before OpenCPN's Activity was even created.
+          if "$AAPT" dump xmltree "$APK" AndroidManifest.xml | \
+            grep -q 'com.google.firebase.provider.FirebaseInitProvider'; then
+            echo "APK unexpectedly contains FirebaseInitProvider." >&2
+            exit 1
+          fi
+          if "$AAPT" dump xmltree "$APK" AndroidManifest.xml | grep -q 'com.google.firebase'; then
+            echo "APK unexpectedly contains Firebase manifest components." >&2
+            "$AAPT" dump xmltree "$APK" AndroidManifest.xml | grep 'com.google.firebase' >&2 || true
+            exit 1
+          fi
 
           # Positive arm64 checks.
           unzip -l "$APK" | grep -q 'lib/arm64-v8a/libgorp.so'
@@ -413,7 +467,7 @@ jobs:
           RELEASE_TAG="opencpn-android-${OPENCPN_TAG}-arm64"
           TITLE="OpenCPN ${OPENCPN_VERSION} Android arm64"
           NOTES=$(cat <<EOF_NOTES
-          Unofficial, debug-signed arm64-only Android build of OpenCPN ${OPENCPN_TAG}.
+          Unofficial, debug-signed arm64-only Android build of OpenCPN ${OPENCPN_TAG}. Firebase Analytics and Crashlytics are removed.
 
           OpenCPN source: https://github.com/OpenCPN/OpenCPN/tree/${OPENCPN_TAG}
           Android packaging: https://github.com/bdbcat/OpenCPN-Android/commit/${ANDROID_COMMIT}
