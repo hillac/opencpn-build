@@ -1,0 +1,361 @@
+name: Build and release OpenCPN Android v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencpn_tag:
+        description: "OpenCPN stable release tag, for example Release_5.14.0"
+        required: true
+        default: "Release_5.14.0"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: opencpn-android-${{ inputs.opencpn_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      NDK_VERSION: "26.1.10909125"
+      BUILD_TOOLS_VERSION: "34.0.0"
+      COMPILE_SDK: "35"
+      OPENCPN_TAG: ${{ inputs.opencpn_tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake gettext git ninja-build unzip zip
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}"
+
+      - name: Resolve source versions
+        id: versions
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if [[ ! "$OPENCPN_TAG" =~ ^Release_([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Only stable OpenCPN tags such as Release_5.14.0 are supported." >&2
+            exit 1
+          fi
+          OPENCPN_VERSION="${BASH_REMATCH[1]}"
+
+          WORK="$RUNNER_TEMP/opencpn-android-build"
+          OCPN_SRC="$WORK/OpenCPN"
+          ANDROID_SRC="$WORK/OpenCPN-Android"
+          COMMON_SRC="$WORK/OCPNAndroidCommon"
+          mkdir -p "$WORK"
+
+          git clone --depth 1 --branch "$OPENCPN_TAG" \
+            https://github.com/OpenCPN/OpenCPN.git "$OCPN_SRC"
+
+          # Full history is intentional. We select the newest Android packaging
+          # commit whose versionName matches the requested OpenCPN release.
+          git clone https://github.com/bdbcat/OpenCPN-Android.git "$ANDROID_SRC"
+          ANDROID_COMMIT=""
+          while read -r sha; do
+            if git -C "$ANDROID_SRC" show "$sha:app/build.gradle" 2>/dev/null \
+              | grep -Fq "versionName \"$OPENCPN_VERSION\""; then
+              ANDROID_COMMIT="$sha"
+              break
+            fi
+          done < <(git -C "$ANDROID_SRC" rev-list --first-parent master)
+
+          if [[ -z "$ANDROID_COMMIT" ]]; then
+            echo "No OpenCPN-Android packaging commit found for version $OPENCPN_VERSION." >&2
+            exit 1
+          fi
+          git -C "$ANDROID_SRC" checkout --detach "$ANDROID_COMMIT"
+
+          # This repository contains the Qt Android runtime used by the APK packager.
+          git clone --depth 1 https://github.com/bdbcat/OCPNAndroidCommon.git "$COMMON_SRC"
+
+          {
+            echo "version=$OPENCPN_VERSION"
+            echo "work=$WORK"
+            echo "ocpn_src=$OCPN_SRC"
+            echo "android_src=$ANDROID_SRC"
+            echo "common_src=$COMMON_SRC"
+            echo "android_commit=$ANDROID_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build OpenCPN native libraries for Android
+        shell: bash
+        env:
+          OCPN_SRC: ${{ steps.versions.outputs.ocpn_src }}
+        run: |
+          set -euxo pipefail
+
+          TOOL_BASE="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
+          test -x "$TOOL_BASE/bin/armv7a-linux-androideabi21-clang++"
+          test -x "$TOOL_BASE/bin/aarch64-linux-android21-clang++"
+          test -x "$TOOL_BASE/bin/llvm-ar"
+          test -x "$TOOL_BASE/bin/llvm-ranlib"
+          test -x "$TOOL_BASE/bin/llvm-strip"
+
+          # OpenCPN 5.14.0 hard-codes aarch64-linux-android-ar for arm64.
+          # That binary does not exist in NDK 26. Patch OpenCPN's toolchain
+          # source before configure so its own unconditional set(CMAKE_AR ...)
+          # cannot override a command-line cache value.
+          OCPN_TOOLCHAIN="$OCPN_SRC/buildandroid/build_android.cmake"
+          python3 - "$OCPN_TOOLCHAIN" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = "set(CMAKE_AR ${tool_base}/bin/aarch64-linux-android-ar)"
+          new = "set(CMAKE_AR ${tool_base}/bin/llvm-ar)"
+
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one obsolete arm64 archiver setting in {path}, found {count}"
+              )
+
+          text = text.replace(old, new, 1)
+
+          # Set ranlib explicitly for both ABI branches. LLVM's unprefixed
+          # binutils are the supported NDK tools and are ABI-independent.
+          lines = text.splitlines()
+          ar_indexes = [i for i, line in enumerate(lines)
+                        if line.strip() == "set(CMAKE_AR ${tool_base}/bin/llvm-ar)"]
+          if len(ar_indexes) != 2:
+              raise SystemExit(
+                  f"Expected two llvm-ar settings after patching {path}, found {len(ar_indexes)}"
+              )
+
+          output = []
+          for line in lines:
+              output.append(line)
+              if line.strip() == "set(CMAKE_AR ${tool_base}/bin/llvm-ar)":
+                  indent = line[:len(line) - len(line.lstrip())]
+                  output.append(indent + "set(CMAKE_RANLIB ${tool_base}/bin/llvm-ranlib)")
+          path.write_text("\n".join(output) + "\n")
+          PY
+
+          grep -nE 'CMAKE_(AR|RANLIB)' "$OCPN_TOOLCHAIN"
+          if grep -Fq 'aarch64-linux-android-ar' "$OCPN_TOOLCHAIN"; then
+            echo "Obsolete NDK archiver still present in OpenCPN toolchain." >&2
+            exit 1
+          fi
+
+          # OpenCPN otherwise downloads RapidJSON v1.1.0 and applies four
+          # legacy in-tree patches with GNU patch. The failed run proved that
+          # this mutation path can leave document.h truncated. Avoid that path
+          # completely by supplying the exact pristine v1.1.0 source tree via
+          # RAPIDJSON, which makes OpenCPN use its existing find_path branch.
+          RAPIDJSON_COMMIT="f54b0e47a08782a6131cc3d60f94d038fa6e0a51"
+          RAPIDJSON_SRC="$RUNNER_TEMP/rapidjson-v1.1.0"
+          git clone --depth 1 --branch v1.1.0 \
+            https://github.com/Tencent/rapidjson.git "$RAPIDJSON_SRC"
+          test "$(git -C "$RAPIDJSON_SRC" rev-parse HEAD)" = "$RAPIDJSON_COMMIT"
+
+          RAPIDJSON_DOC="$RAPIDJSON_SRC/include/rapidjson/document.h"
+          test -s "$RAPIDJSON_DOC"
+          grep -Fq '#ifndef RAPIDJSON_DOCUMENT_H_' "$RAPIDJSON_DOC"
+          grep -Fq '#endif // RAPIDJSON_DOCUMENT_H_' "$RAPIDJSON_DOC"
+          grep -Fq 'bool EraseMember(const GenericValue<EncodingType, SourceAllocator>& name) const {' "$RAPIDJSON_DOC"
+
+          build_one() {
+            local build_dir="$1"
+            local target_tuple="$2"
+
+            cmake -S "$OCPN_SRC" -B "$OCPN_SRC/$build_dir" \
+              -DCMAKE_BUILD_TYPE=Release \
+              "-DOCPN_TARGET_TUPLE:STRING=$target_tuple" \
+              -DOCPN_BUILD_SAMPLE=ON \
+              -Dtool_base="$TOOL_BASE" \
+              -DRAPIDJSON:PATH="$RAPIDJSON_SRC/include/rapidjson"
+
+            # Guard both workarounds. Fail before compiling if either CMake
+            # silently falls back to the broken path or selects the old tool.
+            grep -Fq "${RAPIDJSON_SRC}/include" "$OCPN_SRC/$build_dir/CMakeCache.txt"
+            test ! -d "$OCPN_SRC/$build_dir/_deps/rapidjson_src-src"
+
+            AR_FROM_RULES="$(grep -RhoE '/[^ ]*/(aarch64-linux-android-ar|llvm-ar)' \
+              "$OCPN_SRC/$build_dir"/CMakeFiles \
+              "$OCPN_SRC/$build_dir"/_deps/lunasvg-build/CMakeFiles 2>/dev/null \
+              | sort -u || true)"
+            if printf '%s\n' "$AR_FROM_RULES" | grep -q 'aarch64-linux-android-ar'; then
+              echo "Generated build rules still reference obsolete aarch64-linux-android-ar:" >&2
+              printf '%s\n' "$AR_FROM_RULES" >&2
+              exit 1
+            fi
+
+            cmake --build "$OCPN_SRC/$build_dir" --target lunasvg --parallel 2
+            cmake --build "$OCPN_SRC/$build_dir" --parallel 2
+            test -s "$OCPN_SRC/$build_dir/libgorp.so"
+          }
+
+          build_one build_android_32_cci_22b "Android-armhf;16;armhf"
+          build_one build_android_64_cci_22b "Android-arm64;16;arm64"
+
+          file "$OCPN_SRC/build_android_32_cci_22b/libgorp.so" | tee /tmp/gorp32.txt
+          file "$OCPN_SRC/build_android_64_cci_22b/libgorp.so" | tee /tmp/gorp64.txt
+          grep -q 'ELF 32-bit' /tmp/gorp32.txt
+          grep -q 'ELF 64-bit' /tmp/gorp64.txt
+
+      - name: Prepare Android packaging project
+        shell: bash
+        env:
+          OCPN_SRC: ${{ steps.versions.outputs.ocpn_src }}
+          ANDROID_SRC: ${{ steps.versions.outputs.android_src }}
+          COMMON_SRC: ${{ steps.versions.outputs.common_src }}
+        run: |
+          set -euxo pipefail
+
+          # Upstream's Gradle file contains the maintainer's absolute local paths.
+          # Replace only those roots, leaving the upstream task layout intact.
+          OCPN_SRC="$OCPN_SRC" ANDROID_SRC="$ANDROID_SRC" COMMON_SRC="$COMMON_SRC" python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ["ANDROID_SRC"]) / "app" / "build.gradle"
+          text = path.read_text()
+
+          replacements = {
+              "Qt_Base": str(Path(os.environ["COMMON_SRC"]) / "qt5"),
+              "OCPN_Base": os.environ["OCPN_SRC"],
+          }
+
+          for name, value in replacements.items():
+              pattern = rf'def\s+{re.escape(name)}\s*=\s*"[^"]*"'
+              replacement = f'def {name} = "{value}"'
+              text, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(f"Could not patch {name} in {path}")
+
+          path.write_text(text)
+          PY
+
+          # google-services.json is private in the maintainer's build environment.
+          # A non-production placeholder lets the open-source debug APK build while
+          # keeping Firebase/Crashlytics dependencies structurally intact.
+          cat > "$ANDROID_SRC/app/google-services.json" <<'JSON'
+          {
+            "project_info": {
+              "project_number": "123456789000",
+              "project_id": "opencpn-local-ci",
+              "storage_bucket": "opencpn-local-ci.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "org.opencpn.opencpn"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDUMMY_OPENCPN_LOCAL_CI_KEY_0000000"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+
+          # Fail early if the prebuilt Qt payload expected by upstream Gradle is missing.
+          test -s "$COMMON_SRC/qt5/build_arm32_19_O3/qtbase/jar/QtAndroid.jar"
+          test -s "$COMMON_SRC/qt5/build_arm32_19_O3/qtbase/lib/libQt5Core.so"
+          test -s "$COMMON_SRC/qt5/build_arm64_O3/qtbase/lib/libQt5Core.so"
+          test -s "$OCPN_SRC/build_android_32_cci_22b/libgorp.so"
+          test -s "$OCPN_SRC/build_android_64_cci_22b/libgorp.so"
+
+      - name: Build installable APK
+        id: apk
+        shell: bash
+        env:
+          ANDROID_SRC: ${{ steps.versions.outputs.android_src }}
+          OPENCPN_VERSION: ${{ steps.versions.outputs.version }}
+        run: |
+          set -euxo pipefail
+          cd "$ANDROID_SRC"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK" ]]; then
+            echo "Gradle completed but no debug APK was found." >&2
+            exit 1
+          fi
+
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          AAPT="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/aapt"
+          "$APKSIGNER" verify --verbose "$APK"
+          "$AAPT" dump badging "$APK" | grep -q "package: name='org.opencpn.opencpn'"
+          "$AAPT" dump badging "$APK" | grep -q "versionName='$OPENCPN_VERSION'"
+
+          unzip -l "$APK" | grep -q 'lib/armeabi-v7a/libgorp.so'
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libgorp.so'
+          unzip -l "$APK" | grep -q 'lib/armeabi-v7a/libQt5Core.so'
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libQt5Core.so'
+
+          OUT="$RUNNER_TEMP/OpenCPN-${OPENCPN_VERSION}-Android-debug.apk"
+          cp "$APK" "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$OUT")" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          OPENCPN_VERSION: ${{ steps.versions.outputs.version }}
+          ANDROID_COMMIT: ${{ steps.versions.outputs.android_commit }}
+        run: |
+          set -euxo pipefail
+
+          RELEASE_TAG="opencpn-android-${OPENCPN_TAG}"
+          TITLE="OpenCPN ${OPENCPN_VERSION} Android"
+          NOTES=$(cat <<EOF
+          Unofficial, debug-signed Android build of OpenCPN ${OPENCPN_TAG}.
+
+          OpenCPN source: https://github.com/OpenCPN/OpenCPN/tree/${OPENCPN_TAG}
+          Android packaging: https://github.com/bdbcat/OpenCPN-Android/commit/${ANDROID_COMMIT}
+          APK: ${APK_NAME}
+
+          This APK is debug-signed by GitHub Actions. It is not signed with the official OpenCPN/Google Play signing key.
+          EOF
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK_PATH" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$APK_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi
