@@ -112,6 +112,28 @@ jobs:
           test -x "$TOOL_BASE/bin/armv7a-linux-androideabi21-clang++"
           test -x "$TOOL_BASE/bin/aarch64-linux-android21-clang++"
 
+          # Newer GNU patch versions can strip the const-qualifier and function
+          # body from the EraseMember template member function in rapidjson's
+          # GenericObject, leaving an incomplete declaration that clang rejects
+          # with "expected ';' at end of declaration list".  This script restores
+          # the correct one-line definition when that truncation has occurred.
+          cat > /tmp/fix_rapidjson.py <<'PYEOF'
+          import sys, re, pathlib
+          doc = (pathlib.Path(sys.argv[1])
+                 / '_deps' / 'rapidjson_src-src' / 'include' / 'rapidjson' / 'document.h')
+          if not doc.exists():
+              raise SystemExit(0)
+          text = doc.read_text()
+          fixed, n = re.subn(
+              r'(    template <typename SourceAllocator> bool EraseMember'
+              r'\(const GenericValue<EncodingType, SourceAllocator>&\s*name\))\s*$',
+              r'\1 const { return value_.EraseMember(name); }',
+              text, flags=re.MULTILINE)
+          if n:
+              doc.write_text(fixed)
+              print(f'Fixed rapidjson EraseMember in {doc}')
+          PYEOF
+
           build_one() {
             local build_dir="$1"
             local target_tuple="$2"
@@ -121,6 +143,8 @@ jobs:
               "-DOCPN_TARGET_TUPLE:STRING=$target_tuple" \
               -DOCPN_BUILD_SAMPLE=ON \
               -Dtool_base="$TOOL_BASE"
+
+            python3 /tmp/fix_rapidjson.py "$OCPN_SRC/$build_dir"
 
             cmake --build "$OCPN_SRC/$build_dir" --target lunasvg --parallel 2
             cmake --build "$OCPN_SRC/$build_dir" --parallel 2
