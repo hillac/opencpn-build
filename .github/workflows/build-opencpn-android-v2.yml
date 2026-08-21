@@ -43,7 +43,17 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y cmake gettext git ninja-build unzip zip
+          sudo apt-get install -y gettext git ninja-build unzip zip python3-pip
+
+          # Pin CMake to the version which is known to configure this exact
+          # OpenCPN 5.14 Android dependency stack successfully. GitHub runner
+          # images are mutable; relying on whichever CMake happens to be on the
+          # image makes FetchContent/legacy CMake behavior non-reproducible.
+          python3 -m pip install --user --upgrade "cmake==3.31.6"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cmake" --version
+          "$HOME/.local/bin/cmake" --version | grep -Fq 'cmake version 3.31.6'
+
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager \
             "platforms;android-${COMPILE_SDK}" \
@@ -181,16 +191,69 @@ jobs:
           grep -Fq 'bool EraseMember(const GenericValue<EncodingType, SourceAllocator>& name) const {' "$RAPIDJSON_DOC"
 
           BUILD_DIR="$OCPN_SRC/build_android_64_cci_22b"
-          cmake -S "$OCPN_SRC" -B "$BUILD_DIR" \
-            -DCMAKE_BUILD_TYPE=Release \
-            "-DOCPN_TARGET_TUPLE:STRING=Android-arm64;16;arm64" \
-            -DOCPN_BUILD_SAMPLE=ON \
-            -Dtool_base="$TOOL_BASE" \
-            -DRAPIDJSON:PATH="$RAPIDJSON_SRC/include/rapidjson"
+
+          # OpenCPN 5.14 uses CMake FetchContent plus an upstream patch stack
+          # for shapelib. A prior successful build of this exact tag proves the
+          # patch set is valid, but a fetched source tree can occasionally be
+          # left malformed during configure. Production CI should never reuse a
+          # half-patched dependency tree. Configure from a completely fresh
+          # binary/FetchContent directory and retry the dependency acquisition
+          # if, and only if, configure itself fails.
+          configure_ok=0
+          for attempt in 1 2 3; do
+            echo "OpenCPN configure attempt $attempt/3"
+            rm -rf "$BUILD_DIR"
+
+            if cmake -S "$OCPN_SRC" -B "$BUILD_DIR" \
+              -DCMAKE_BUILD_TYPE=Release \
+              "-DOCPN_TARGET_TUPLE:STRING=Android-arm64;16;arm64" \
+              -DOCPN_BUILD_SAMPLE=ON \
+              -Dtool_base="$TOOL_BASE" \
+              -DRAPIDJSON:PATH="$RAPIDJSON_SRC/include/rapidjson"; then
+              configure_ok=1
+              break
+            fi
+
+            echo "::warning::OpenCPN CMake configure attempt $attempt failed."
+
+            # Preserve useful evidence before the next clean attempt. The
+            # failure seen in practice is a syntactically damaged patched
+            # shapelib CMakeLists.txt.
+            SHAPE_CMAKE="$BUILD_DIR/_deps/shapelib_src-src/CMakeLists.txt"
+            if [[ -f "$SHAPE_CMAKE" ]]; then
+              echo "shapelib CMakeLists.txt sha256:"
+              sha256sum "$SHAPE_CMAKE" || true
+              echo "shapelib CMakeLists.txt tail:"
+              tail -80 "$SHAPE_CMAKE" || true
+            fi
+
+            rm -rf "$BUILD_DIR"
+            sleep $((attempt * 2))
+          done
+
+          if (( configure_ok == 0 )); then
+            echo "OpenCPN CMake configuration failed from three clean dependency trees." >&2
+            exit 1
+          fi
+
+          # The OpenCPN 5.14 Android build was previously observed working with
+          # CMake 3.31.6; fail if runner PATH drifted despite the pin above.
+          cmake --version
+          cmake --version | grep -Fq 'cmake version 3.31.6'
 
           # Guard both workarounds before compiling.
           grep -Fq "${RAPIDJSON_SRC}/include" "$BUILD_DIR/CMakeCache.txt"
           test ! -d "$BUILD_DIR/_deps/rapidjson_src-src"
+
+          # A successful configure must have a complete shapelib source tree
+          # and generated shp target. These checks catch a half-patched
+          # FetchContent tree before the expensive native compile starts.
+          SHAPE_SRC="$BUILD_DIR/_deps/shapelib_src-src"
+          test -s "$SHAPE_SRC/CMakeLists.txt"
+          test -s "$SHAPE_SRC/shapefil.h"
+          test -s "$SHAPE_SRC/shpopen.c"
+          test -s "$SHAPE_SRC/dbfopen.c"
+          test -d "$BUILD_DIR/libs/shapelib/shapelib_dir/CMakeFiles/shp.dir"
 
           if grep -RqsF 'aarch64-linux-android-ar' \
             "$BUILD_DIR/CMakeFiles" \
