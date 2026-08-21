@@ -1,4 +1,4 @@
-name: Build and release OpenCPN Android arm64
+name: Build and release OpenCPN Android arm64 (no Firebase, v8)
 
 on:
   workflow_dispatch:
@@ -522,21 +522,12 @@ jobs:
           echo "Packaged core locales:"
           find "$ASSET_FILES/locale" -type f -path '*/LC_MESSAGES/opencpn.mo' -print | sort
 
-          # Validate the exact core runtime files implicated by early startup.
-          # These are all read from androidGetSharedDir() during OpenCPN init.
-          required_assets=(
-            "$ASSET_FILES/license.txt"
-            "$ASSET_FILES/Configs/configs.xml"
-            "$ASSET_FILES/styles/qtstylesheet.qss"
-            "$ASSET_FILES/s57data/chartsymbols.xml"
-            "$ASSET_FILES/gshhs/poly-c-1.dat"
-          )
-          for asset in "${required_assets[@]}"; do
-            if [[ ! -s "$asset" ]]; then
-              echo "Required OpenCPN runtime asset missing or empty: $asset" >&2
-              exit 1
-            fi
-          done
+          # Do not validate the rest of app/src/main/assets/files yet.
+          # In the upstream Android packaging project, Gradle preBuild copy
+          # tasks populate runtime assets such as license.txt, Configs,
+          # styles, S57 data and GSHHS.  This preparation step runs before
+          # Gradle, so those files are legitimate build outputs and may not
+          # exist here yet.  They are validated from the final APK below.
 
           CORE_MO_COUNT="$(find "$ASSET_FILES/locale" -type f -path '*/LC_MESSAGES/opencpn.mo' | wc -l)"
           echo "Core OpenCPN catalogs staged in APK assets: $CORE_MO_COUNT"
@@ -607,11 +598,15 @@ jobs:
           ZIPLIST="$RUNNER_TEMP/apk-files.txt"
           unzip -Z1 "$APK" > "$ZIPLIST"
 
-          grep -Fxq 'assets/files/license.txt' "$ZIPLIST"
-          grep -Fxq 'assets/files/Configs/configs.xml' "$ZIPLIST"
-          grep -Fxq 'assets/files/styles/qtstylesheet.qss' "$ZIPLIST"
-          grep -Fxq 'assets/files/s57data/chartsymbols.xml' "$ZIPLIST"
-          grep -Fxq 'assets/files/gshhs/poly-c-1.dat' "$ZIPLIST"
+          # These are produced by upstream Gradle preBuild copy tasks, so the
+          # correct place to assert them is the final APK, not the pre-Gradle
+          # source tree.
+          for required in             'assets/files/license.txt'             'assets/files/Configs/configs.xml'             'assets/files/styles/qtstylesheet.qss'             'assets/files/s57data/chartsymbols.xml'             'assets/files/gshhs/poly-c-1.dat'; do
+            if ! grep -Fxq "$required" "$ZIPLIST"; then
+              echo "Final APK is missing required OpenCPN runtime asset: $required" >&2
+              exit 1
+            fi
+          done
 
           if ! grep -Eq '^assets/files/locale/[^/]+/LC_MESSAGES/opencpn\.mo$' "$ZIPLIST"; then
             echo "APK contains no core OpenCPN opencpn.mo catalog." >&2
