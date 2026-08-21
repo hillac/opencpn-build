@@ -1,4 +1,5 @@
 name: Build and release OpenCPN Android arm64
+
 on:
   workflow_dispatch:
     inputs:
@@ -421,28 +422,42 @@ jobs:
             dest="$ASSET_FILES/locale/$locale/LC_MESSAGES"
             mkdir -p "$dest"
 
-            # Match OpenCPN's normal gettext build behavior. Do not use
-            # --check/--check-format here: at least one upstream 5.14 catalog
-            # (hi_IN) contains a format-string translation defect which strict
-            # msgfmt validation rejects even though ordinary msgfmt can compile
-            # the catalog. We only need a valid binary .mo for runtime loading.
-            msgfmt -o "$dest/opencpn.mo" "$po"
-            test -s "$dest/opencpn.mo"
-
-            # Verify the binary catalog is structurally readable without
-            # re-running strict source-level format checks.
-            msgunfmt "$dest/opencpn.mo" >/dev/null
-
-            compiled_catalogs=$((compiled_catalogs + 1))
+            # Translation catalogs are optional runtime resources. Some
+            # upstream Release_5.14.0 PO files are malformed enough that even
+            # ordinary msgfmt rejects them (for example th_TH). Do not make the
+            # Android application build depend on every Crowdin catalog being
+            # valid. Compile each locale independently and omit only failures;
+            # gettext will fall back to untranslated source strings for an
+            # unavailable locale.
+            if msgfmt -o "$dest/opencpn.mo" "$po"; then
+              if [[ -s "$dest/opencpn.mo" ]] && msgunfmt "$dest/opencpn.mo" >/dev/null; then
+                compiled_catalogs=$((compiled_catalogs + 1))
+              else
+                echo "::warning file=$po::Generated catalog is empty or unreadable; omitting locale $locale"
+                rm -f "$dest/opencpn.mo"
+              fi
+            else
+              echo "::warning file=$po::Upstream PO catalog failed msgfmt; omitting locale $locale"
+              rm -f "$dest/opencpn.mo"
+            fi
           done
           shopt -u nullglob
 
           if (( compiled_catalogs == 0 )); then
-            echo "No core OpenCPN PO catalogs were found under $OCPN_SRC/po." >&2
+            echo "No usable core OpenCPN catalogs could be compiled." >&2
             exit 1
           fi
 
-          echo "Core OpenCPN catalogs compiled from release tag: $compiled_catalogs"
+          # en_GB is known-good in Release_5.14.0 and gives us a deterministic
+          # assertion that core catalog staging actually worked.
+          if [[ ! -s "$ASSET_FILES/locale/en_GB/LC_MESSAGES/opencpn.mo" ]]; then
+            echo "Required sanity-check catalog en_GB/opencpn.mo was not generated." >&2
+            exit 1
+          fi
+
+          echo "Core OpenCPN catalogs successfully compiled: $compiled_catalogs"
+          echo "Packaged core locales:"
+          find "$ASSET_FILES/locale" -type f -path '*/LC_MESSAGES/opencpn.mo' -print | sort
 
           # Validate the exact core runtime files implicated by early startup.
           # These are all read from androidGetSharedDir() during OpenCPN init.
